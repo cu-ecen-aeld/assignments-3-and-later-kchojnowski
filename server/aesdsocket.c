@@ -48,7 +48,7 @@ int createSocket(int* socketfd) {
 }
 
 int connectionPrepare(int sockfd) {
-  int ret = listen(sockfd, 0);
+  int ret = listen(sockfd, 10);
   if(ret == -1) {
     perror("Listening socket failed");
     return -1;
