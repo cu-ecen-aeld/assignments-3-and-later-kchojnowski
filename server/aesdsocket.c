@@ -1,16 +1,22 @@
 #include <netdb.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
 #define RECV_BUFFER_CHUNK 100
 
 int closeAppRequest = 0;
+
+pthread_mutex_t fileMutex;
 
 int createSocket(int* socketfd) {
   *socketfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -151,6 +157,24 @@ int returnData(int socketfd) {
 
   return 0;
 }
+
+int saveAndReturnData(int socketfd, char* buf, size_t datalen) {
+  if(saveData(buf, datalen) == -1) {
+    return -1;
+  }
+
+  if(returnData(socketfd) == -1) {
+    free(buf);
+    close(socketfd);
+    return -1;
+  }
+
+  free(buf);
+  close(socketfd);
+
+  return 0;
+}
+
 void signalHandler(int signum) {
   syslog(LOG_DEBUG, "Caught signal, exiting");
   closeAppRequest = 1;
@@ -166,6 +190,67 @@ int registerSignalHandler(void) {
   }
 
   return 0;
+}
+
+struct threadListData {
+  pthread_t thread;
+  int acceptedfd;
+  struct sockaddr addr;
+  bool finish;
+  SLIST_ENTRY(threadListData) entries;
+};
+
+void* serverThread(void* arg) {
+  struct threadListData* data = (struct threadListData*)arg;
+  int acceptedfd = data->acceptedfd;
+  char* buf;
+  size_t datalen = 0;
+
+  if(receiveData(acceptedfd, &buf, &datalen) == -1) {
+    close(acceptedfd);
+    free(buf);
+    data->finish = true;
+    return NULL;
+  }
+
+  if(pthread_mutex_lock(&fileMutex) == 0) {
+    saveAndReturnData(acceptedfd, buf, datalen);
+  } else {
+    data->finish = true;
+    return NULL;
+  }
+  pthread_mutex_unlock(&fileMutex);
+
+  char msg[128];
+  int msglen = snprintf(msg, sizeof(msg), "Closed connection from");
+  for(int i = 0; i < sizeof(data->addr.sa_data); i++)
+    msglen += snprintf(msg + msglen, sizeof(msg) - msglen, " %d", data->addr.sa_data[i]);
+  syslog(LOG_DEBUG, "%s", msg);
+
+  data->finish = true;
+  return NULL;
+}
+
+void timerThread(union sigval arg) {
+  char outstr[200];
+  time_t t;
+  struct tm *tmp;
+
+  t = time(NULL);
+  tmp = localtime(&t);
+  if (tmp == NULL) {
+    perror("localtime");
+    return;
+  }
+
+  if (strftime(outstr, sizeof(outstr), "timestamp:%Y-%m-%d %H:%M:%S\n", tmp) == 0) {
+    return;
+  }
+
+  if(pthread_mutex_lock(&fileMutex) == 0) {
+    saveData(outstr, strlen(outstr));
+  }
+  pthread_mutex_unlock(&fileMutex);
 }
 
 int main(int argc, char *argv[]) {
@@ -203,43 +288,64 @@ int main(int argc, char *argv[]) {
 
   registerSignalHandler();
 
+  pthread_mutex_init(&fileMutex, NULL);
+
+  timer_t timerid;
+  struct sigevent sigevt = { 0 };
+  sigevt.sigev_notify = SIGEV_THREAD;
+  sigevt.sigev_notify_function = timerThread;
+  timer_create(CLOCK_MONOTONIC, &sigevt, &timerid);
+
+  struct itimerspec its = { 0 };
+  its.it_value.tv_sec = 10;
+  its.it_interval.tv_sec = 10;
+  timer_settime(timerid, 0, &its, NULL);
+
+  SLIST_HEAD(threadListHead, threadListData) threadList;
+  SLIST_INIT(&threadList);
+
   connectionPrepare(sockfd);
 
   while(closeAppRequest == 0) {
     struct sockaddr addr = { 0 };
     int acceptedfd = connectionWait(sockfd, &addr);
 
+    struct threadListData* listMember;
+    while(true) {
+      bool foundDoneTherad = false;
+      struct threadListData* doneMember = NULL;
+      SLIST_FOREACH(listMember, &threadList, entries) {
+        if(listMember->finish) {
+          foundDoneTherad = true;
+          doneMember = listMember;
+        }
+      }
+
+      if(foundDoneTherad) {
+        pthread_join(doneMember->thread, NULL);
+        SLIST_REMOVE(&threadList, doneMember, threadListData, entries);
+        free(doneMember);
+      }
+      else {
+        break;
+      }
+
+    }
+
     if(closeAppRequest) {
       break;
     }
 
-    char* buf;
-    size_t datalen = 0;
-    if(receiveData(acceptedfd, &buf, &datalen) == -1) {
-      close(acceptedfd);
-      free(buf);
-      break;
-    }
+    listMember = calloc(1, sizeof(struct threadListData));
+    listMember->acceptedfd = acceptedfd;
+    listMember->addr = addr;
 
-    if(saveData(buf, datalen) == -1) {
-      break;
-    }
+    pthread_create(&listMember->thread, NULL, serverThread, listMember);
 
-    if(returnData(acceptedfd) == -1) {
-      free(buf);
-      close(acceptedfd);
-      break;
-    }
-
-    free(buf);
-    close(acceptedfd);
-    char msg[128];
-    int msglen = snprintf(msg, sizeof(msg), "Closed connection from");
-    for(int i = 0; i < sizeof(addr.sa_data); i++)
-      msglen += snprintf(msg + msglen, sizeof(msg) - msglen, " %d", addr.sa_data[i]);
-    syslog(LOG_DEBUG, "%s", msg);
+    SLIST_INSERT_HEAD(&threadList, listMember, entries);
   }
 
+  timer_delete(timerid);
   close(sockfd);
   deleteDataFile();
   fclose(stdin);
