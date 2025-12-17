@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "Starting aesdsocket daemon"
+/usr/bin/aesdsocket -d
