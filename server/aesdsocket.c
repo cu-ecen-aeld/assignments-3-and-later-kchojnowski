@@ -14,6 +14,16 @@
 
 #define RECV_BUFFER_CHUNK 100
 
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
+#if USE_AESD_CHAR_DEVICE == 1
+#define DATA_FILE "/dev/aesdchar"
+#else
+#define DATA_FILE "/var/tmp/aesdsocketdata"
+#endif
+
 int closeAppRequest = 0;
 
 pthread_mutex_t fileMutex;
@@ -107,11 +117,11 @@ int receiveData(int socketfd, char** buf, size_t* datalen) {
 }
 
 void deleteDataFile() {
-  remove("/var/tmp/aesdsocketdata");
+  remove(DATA_FILE);
 }
 
 int saveData(char* data, size_t datalen) {
-  FILE* f = fopen("/var/tmp/aesdsocketdata", "a");
+  FILE* f = fopen(DATA_FILE, "a");
   if(f == NULL) {
     perror("Could not open file");
     return -1;
@@ -132,7 +142,7 @@ int saveData(char* data, size_t datalen) {
 }
 
 int returnData(int socketfd) {
-  FILE* f = fopen("/var/tmp/aesdsocketdata", "r");
+  FILE* f = fopen(DATA_FILE, "r");
   if(f == NULL) {
     perror("Could not open file");
     return -1;
@@ -290,6 +300,7 @@ int main(int argc, char *argv[]) {
 
   pthread_mutex_init(&fileMutex, NULL);
 
+#if USE_AESD_CHAR_DEVICE != 1
   timer_t timerid;
   struct sigevent sigevt = { 0 };
   sigevt.sigev_notify = SIGEV_THREAD;
@@ -300,6 +311,7 @@ int main(int argc, char *argv[]) {
   its.it_value.tv_sec = 10;
   its.it_interval.tv_sec = 10;
   timer_settime(timerid, 0, &its, NULL);
+#endif
 
   SLIST_HEAD(threadListHead, threadListData) threadList;
   SLIST_INIT(&threadList);
@@ -345,9 +357,11 @@ int main(int argc, char *argv[]) {
     SLIST_INSERT_HEAD(&threadList, listMember, entries);
   }
 
+#if USE_AESD_CHAR_DEVICE != 1
   timer_delete(timerid);
-  close(sockfd);
   deleteDataFile();
+#endif
+  close(sockfd);
   fclose(stdin);
   fclose(stdout);
   fclose(stderr);
