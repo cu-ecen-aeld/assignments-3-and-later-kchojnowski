@@ -14,6 +14,7 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/printk.h>
+#include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/cdev.h>
 #include <linux/fs.h> // file_operations
@@ -48,22 +49,65 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
                 loff_t *f_pos)
 {
     ssize_t retval = 0;
+    size_t i, offset, written = 0;
+    struct aesd_buffer_entry* entry = NULL;
+
     PDEBUG("read %zu bytes with offset %lld",count,*f_pos);
     /**
      * TODO: handle read
      */
-    return retval;
+    mutex_lock(&aesd_device.lock);
+
+    for(i = *f_pos; i < count + *f_pos; i++) {
+        offset = 0;
+        entry = aesd_circular_buffer_find_entry_offset_for_fpos(
+                    &aesd_device.buffer, i, &offset);
+	if(entry == NULL)
+            break;
+        copy_to_user(buf + written, &entry->buffptr[offset], 1);
+	written++;
+    }
+    *f_pos = written;
+    mutex_unlock(&aesd_device.lock);
+    return written;
 }
 
 ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
                 loff_t *f_pos)
 {
     ssize_t retval = -ENOMEM;
+    struct aesd_buffer_entry entry;
+    void* retptr = NULL;
     PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
     /**
      * TODO: handle write
      */
-    return retval;
+    mutex_lock(&aesd_device.lock);
+
+    if(aesd_device.tmpbuf == NULL) {
+        aesd_device.tmpbuf = kmalloc(count, GFP_KERNEL);
+        copy_from_user(aesd_device.tmpbuf, buf, count);
+        aesd_device.tmpbuflen = count;
+    } else {
+        char* newtmpbuf = kmalloc(count + aesd_device.tmpbuflen, GFP_KERNEL);
+	memcpy(newtmpbuf, aesd_device.tmpbuf, aesd_device.tmpbuflen);
+        copy_from_user(newtmpbuf + aesd_device.tmpbuflen, buf, count);
+	kfree(aesd_device.tmpbuf);
+        aesd_device.tmpbuf = newtmpbuf;
+        aesd_device.tmpbuflen += count;	
+    }
+
+    if(aesd_device.tmpbuf[aesd_device.tmpbuflen - 1] == '\n') {
+        entry.size = aesd_device.tmpbuflen;
+        entry.buffptr = aesd_device.tmpbuf;
+	aesd_device.tmpbuflen = 0;
+	aesd_device.tmpbuf = NULL;
+        retptr = aesd_circular_buffer_add_entry(&aesd_device.buffer, &entry);
+        if(retptr != NULL)
+            kfree(retptr);
+    }
+    mutex_unlock(&aesd_device.lock);
+    return count;
 }
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
@@ -105,6 +149,11 @@ int aesd_init_module(void)
     /**
      * TODO: initialize the AESD specific portion of the device
      */
+    PDEBUG("init module");
+    aesd_circular_buffer_init(&aesd_device.buffer);
+    aesd_device.tmpbuf = NULL;
+    aesd_device.tmpbuflen = 0;
+    mutex_init(&aesd_device.lock);
 
     result = aesd_setup_cdev(&aesd_device);
 
@@ -117,6 +166,8 @@ int aesd_init_module(void)
 
 void aesd_cleanup_module(void)
 {
+    struct aesd_buffer_entry *entry;
+    size_t index;
     dev_t devno = MKDEV(aesd_major, aesd_minor);
 
     cdev_del(&aesd_device.cdev);
@@ -124,6 +175,10 @@ void aesd_cleanup_module(void)
     /**
      * TODO: cleanup AESD specific poritions here as necessary
      */
+    PDEBUG("cleanup module");
+    AESD_CIRCULAR_BUFFER_FOREACH(entry, &aesd_device.buffer, index) {
+      kfree(entry->buffptr);
+    }
 
     unregister_chrdev_region(devno, 1);
 }
