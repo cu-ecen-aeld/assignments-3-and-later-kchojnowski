@@ -11,6 +11,7 @@
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 #define RECV_BUFFER_CHUNK 100
 
@@ -141,8 +142,10 @@ int saveData(char* data, size_t datalen) {
   return 0;
 }
 
-int returnData(int socketfd) {
-  FILE* f = fopen(DATA_FILE, "r");
+int returnData(int socketfd, FILE* f) {
+  if(f == NULL) {
+    f = fopen(DATA_FILE, "r");
+  }
   if(f == NULL) {
     perror("Could not open file");
     return -1;
@@ -173,7 +176,7 @@ int saveAndReturnData(int socketfd, char* buf, size_t datalen) {
     return -1;
   }
 
-  if(returnData(socketfd) == -1) {
+  if(returnData(socketfd, NULL) == -1) {
     free(buf);
     close(socketfd);
     return -1;
@@ -223,11 +226,26 @@ void* serverThread(void* arg) {
     return NULL;
   }
 
-  if(pthread_mutex_lock(&fileMutex) == 0) {
-    saveAndReturnData(acceptedfd, buf, datalen);
+  if((datalen >= strlen("AESDCHAR_IOCSEEKTO:"))
+    && (strncmp("AESDCHAR_IOCSEEKTO:", buf, strlen("AESDCHAR_IOCSEEKTO:")) == 0)) {
+    struct aesd_seekto seekto;
+    sscanf(buf, "AESDCHAR_IOCSEEKTO:%d,%d", &seekto.write_cmd, &seekto.write_cmd_offset);
+    FILE* f = fopen(DATA_FILE, "rw");
+    ioctl(fileno(f), AESDCHAR_IOCSEEKTO, &seekto);
+
+    if(pthread_mutex_lock(&fileMutex) == 0) {
+      returnData(acceptedfd, f);
+    } else {
+      data->finish = true;
+      return NULL;
+    }
   } else {
-    data->finish = true;
-    return NULL;
+    if(pthread_mutex_lock(&fileMutex) == 0) {
+      saveAndReturnData(acceptedfd, buf, datalen);
+    } else {
+      data->finish = true;
+      return NULL;
+    }
   }
   pthread_mutex_unlock(&fileMutex);
 
